@@ -1,9 +1,13 @@
 package com.crealytics.spark
 
+import java.math.BigDecimal
+
 import com.norbitltd.spoiwo.model.Sheet
 import org.apache.poi.ss.usermodel.Row.MissingCellPolicy
-import org.apache.poi.ss.usermodel.{Cell, CellType, Row}
+import org.apache.poi.ss.usermodel.{Cell, CellType, DataFormatter, Row, Sheet => PSheet, Workbook}
 import org.apache.spark.sql.{DataFrameReader, DataFrameWriter}
+
+import scala.util.{Failure, Success, Try}
 
 package object excel {
   implicit class RichRow(val row: Row) extends AnyVal {
@@ -40,6 +44,45 @@ package object excel {
           case CellType.BOOLEAN => cell.getBooleanCellValue
         }
     }
+    def stringValue: Option[String] = {
+      val dataFormatter = new DataFormatter()
+      cell.getCellType match {
+        case CellType.BLANK => None
+        case CellType.FORMULA =>
+          cell.getCachedFormulaResultType match {
+            case CellType.STRING => Option(cell.getRichStringCellValue).map(_.getString)
+            case CellType.NUMERIC => Option(cell.getNumericCellValue).map(_.toString)
+            case CellType.BLANK => None
+            case _ => Some(dataFormatter.formatCellValue(cell))
+          }
+        case CellType.BLANK => None
+        case _ => Some(dataFormatter.formatCellValue(cell))
+      }
+    }
+
+    def parseNumber(string: Option[String]): Option[Double] = string.filter(_.trim.nonEmpty).map(stringToDouble)
+    def numericValue: Option[Double] =
+      cell.getCellType match {
+        case CellType.BLANK => None
+        case CellType.NUMERIC => Option(cell.getNumericCellValue)
+        case CellType.STRING => parseNumber(Option(cell.getStringCellValue))
+        case CellType.FORMULA =>
+          cell.getCachedFormulaResultType match {
+            case CellType.NUMERIC => Option(cell.getNumericCellValue)
+            case CellType.STRING =>
+              parseNumber(Option(cell.getRichStringCellValue).map(_.getString))
+          }
+      }
+    def booleanValue: Option[Boolean] = cell.getCellType match {
+      case CellType.BLANK => None
+      case CellType.BOOLEAN => Option(cell.getBooleanCellValue)
+      case CellType.STRING => Option(cell.getStringCellValue).map(_.toBoolean)
+    }
+    // TODO: We're losing precision here by first extracting a double and then converting
+    //       to a BigDecimal. The getNumericCellValue uses _cell.getV to get the String
+    //       value of a cell, but this is quite specific and might not port over to the
+    //       streaming implementation
+    def bigDecimalValue: Option[BigDecimal] = numericValue.map(new BigDecimal(_))
   }
 
   implicit class RichSpoiwoSheet(val sheet: Sheet) extends AnyVal {
@@ -50,6 +93,18 @@ package object excel {
       val tableRows = sheet.rows.filter(r => r.index.exists((startRow to endRow).contains))
       tableRows.map(_.cells.filter(_.index.exists((startColumn to endColumn).contains)).map(_.value).to[Seq])
     }
+  }
+
+  implicit class RichWorkbook(val workBook: Workbook) extends AnyVal {
+
+    def findSheet(sheetName: Option[String]): Option[PSheet] =
+      sheetName
+        .flatMap(
+          sn =>
+            Try(Option(workBook.getSheetAt(sn.toInt))).toOption.flatten
+              .orElse(Option(workBook.getSheet(sn)))
+        )
+        .orElse(Try(workBook.getSheetAt(0)).toOption)
   }
 
   implicit class ExcelDataFrameReader(val dataFrameReader: DataFrameReader) extends AnyVal {
@@ -74,7 +129,7 @@ package object excel {
         "maxRowsInMemory" -> maxRowsInMemory,
         "excerptSize" -> excerptSize,
         "workbookPassword" -> workbookPassword
-      ).foldLeft(dataFrameReader.format("com.crealytics.spark.excel")) {
+      ).foldLeft(dataFrameReader.format("excel")) {
         case (dfReader, (key, value)) =>
           value match {
             case null => dfReader
@@ -84,6 +139,12 @@ package object excel {
     }
   }
 
+  private def stringToDouble(value: String): Double = {
+    Try(value.toDouble) match {
+      case Success(d) => d
+      case Failure(_) => Double.NaN
+    }
+  }
   implicit class ExcelDataFrameWriter[T](val dataFrameWriter: DataFrameWriter[T]) extends AnyVal {
     def excel(
       header: Boolean = true,
@@ -91,15 +152,17 @@ package object excel {
       preHeader: String = null,
       dateFormat: String = null,
       timestampFormat: String = null,
-      workbookPassword: String = null
+      workbookPassword: String = null,
+      singleFile: Boolean = true
     ): DataFrameWriter[T] = {
+      val format = if (singleFile) "excel-single-file" else "excel"
       Map(
         "header" -> header,
         "dataAddress" -> dataAddress,
         "dateFormat" -> dateFormat,
         "timestampFormat" -> timestampFormat,
         "preHeader" -> preHeader
-      ).foldLeft(dataFrameWriter.format("com.crealytics.spark.excel")) {
+      ).foldLeft(dataFrameWriter.format(format)) {
         case (dfWriter, (key, value)) =>
           value match {
             case null => dfWriter
